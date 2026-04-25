@@ -1,0 +1,51 @@
+name: Deal Sourcing Pipeline
+
+on:
+  schedule:
+    - cron: "0 11 * * 1-5"   # 6am ET (UTC-5) weekdays
+  workflow_dispatch:           # manual trigger from GitHub UI anytime
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Create output dirs
+        run: mkdir -p output logs
+
+      - name: Run deal pipeline
+        env:
+          AIRTABLE_API_KEY:   ${{ secrets.AIRTABLE_API_KEY }}
+          AIRTABLE_BASE_ID:   ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE:     ${{ secrets.AIRTABLE_TABLE }}
+          GMAIL_ADDRESS:      ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL:        ${{ secrets.ALERT_EMAIL }}
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python pipeline.py
+
+      - name: Upload deal CSV as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deals-${{ github.run_number }}
+          path: output/*.csv
+          retention-days: 30
+
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-${{ github.run_number }}
+          path: logs/pipeline.log
+          retention-days: 14
