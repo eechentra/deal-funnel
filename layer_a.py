@@ -1,259 +1,198 @@
 """
-GY6 Deal Pipeline — Layer A v2
-Data sources rebuilt around publicly accessible endpoints that work from GitHub Actions.
-
-Primary: Maryland Property Data - Parcel Points via ArcGIS public portal
-         (data-maryland.opendata.arcgis.com — ESRI-hosted, open IP access)
-Fallback: Prince George's County Planning GIS open data
-          (gisdata.pgplanning.org/opendata — public REST API)
-
-Field mappings from MD iMAP MDProperty View subscriber guide:
-  COUNTY   — county code (AA=02, PG=17, HO=13, CH=08)
-  ACRES    — polygon acres
-  LANDVAL  — land assessed value
-  OWNNAME  — owner name
-  SITEADDR — site address
-  ZONING   — zoning code
-  X / Y    — centroid coordinates (MD State Plane, need projection)
-  LATITUDE / LONGITUDE — decimal degrees (where available)
+GY6 Deal Pipeline — Layer A v3
+Uses Redfin public CSV download — no auth, works from any IP including GitHub Actions.
+Returns active FOR SALE land listings with price, acreage, coordinates.
+Fallback: Realtor.com public JSON API.
 """
 
 import requests
+import csv
+import io
 import time
 import logging
+from urllib.parse import urlencode
 
 log = logging.getLogger(__name__)
 
-# MD iMAP county codes for SDAT data
-COUNTY_CODES = {
-    "anne_arundel":  "02",
-    "prince_georges": "17",
-    "howard":        "13",
-    "charles":       "08",
+REDFIN_COUNTIES = {
+    "anne_arundel":   {"name": "Anne Arundel",   "region_id": "1861", "region_type": "5"},
+    "prince_georges": {"name": "Prince George's", "region_id": "2470", "region_type": "5"},
+    "howard":         {"name": "Howard",           "region_id": "2155", "region_type": "5"},
+    "charles":        {"name": "Charles",          "region_id": "1897", "region_type": "5"},
 }
 
-COUNTY_NAMES = {
-    "anne_arundel":   "Anne Arundel",
-    "prince_georges": "Prince George's",
-    "howard":         "Howard",
-    "charles":        "Charles",
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer": "https://www.redfin.com/",
 }
 
-# ArcGIS public portal — MD Property Data Parcel Points
-# This is ESRI-hosted (not Maryland state servers) so no IP blocking
-ARCGIS_PARCEL_URL = (
-    "https://services.arcgis.com/njFNhDsUCentVYJW/arcgis/rest/services/"
-    "MD_Property_Data_Parcel_Points/FeatureServer/0/query"
-)
 
-# Fallback: PG County Planning open data (direct county endpoint)
-PG_PARCEL_URL = (
-    "https://gisdata.pgplanning.org/opendata/rest/services/"
-    "OpenData/Property/MapServer/0/query"
-)
-
-# Maryland open data ArcGIS hub (alternative)
-MD_HUB_URL = (
-    "https://geodata.md.gov/imap/rest/services/"
-    "PlanningCadastre/MD_PropertyData/MapServer/0/query"
-)
-
-
-def pull_parcels_arcgis(county_key: str, buy_box: dict, max_records: int = 1000) -> list[dict]:
-    """
-    Pull parcels from Maryland ArcGIS public portal.
-    Filters by county code, acreage range, and land use (vacant/residential land).
-    """
-    county_code = COUNTY_CODES[county_key]
-    county_name = COUNTY_NAMES[county_key]
-    min_ac = buy_box["min_acres"]
-    max_ac = buy_box["max_acres"]
-    max_price = buy_box["max_price"]
-
-    log.info(f"  Trying ArcGIS portal for {county_name}...")
-
-    # Land use codes for vacant/undeveloped residential land in MD iMAP
-    # LU codes: 1100=residential, 1110=single family, 1130=MF, 9000=vacant
-    # We want vacant residential and low-density residential that allows modular
-    where_clause = (
-        f"COUNTY='{county_code}' AND "
-        f"ACRES >= {min_ac} AND ACRES <= {max_ac} AND "
-        f"(LANDVAL <= {max_price * 1.5} OR LANDVAL IS NULL) AND "
-        f"(DESCLU LIKE '%RESID%' OR DESCLU LIKE '%VACANT%' OR "
-        f"LU IN ('1100','1130','1140','9000','9100','9110','1300'))"
-    )
+def pull_redfin_land(county_key: str, buy_box: dict) -> list[dict]:
+    county = REDFIN_COUNTIES[county_key]
+    log.info(f"  Pulling Redfin listings: {county['name']}...")
 
     params = {
-        "where":          where_clause,
-        "outFields":      "OBJECTID,COUNTY,ACRES,LANDVAL,OWNNAME,SITEADDR,ZONING,LU,DESCLU,LATITUDE,LONGITUDE,X,Y",
-        "returnGeometry": "false",
-        "f":              "json",
-        "resultRecordCount": max_records,
-        "orderByFields":  "ACRES ASC",
+        "al":          1,
+        "market":      "dc",
+        "max_price":   int(buy_box["max_price"] * 1.5),
+        "num_homes":   350,
+        "ord":         "redfin-recommended-asc",
+        "page_number": 1,
+        "property_type": 6,
+        "region_id":   county["region_id"],
+        "region_type": county["region_type"],
+        "status":      9,
+        "uipt":        6,
+        "v":           8,
     }
 
-    try:
-        r = requests.get(ARCGIS_PARCEL_URL, params=params, timeout=30,
-                         headers={"User-Agent": "GY6-DealPipeline/1.0"})
-        r.raise_for_status()
-        data = r.json()
+    url = "https://www.redfin.com/stingray/api/gis-csv?" + urlencode(params)
 
-        if "error" in data:
-            log.warning(f"  ArcGIS error: {data['error']}")
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        if r.status_code != 200:
+            log.warning(f"  Redfin {r.status_code} for {county['name']}")
             return []
 
-        features = data.get("features", [])
-        parcels = []
-        for f in features:
-            attrs = f.get("attributes", {})
-            # Normalize field names to match rest of pipeline
-            normalized = {
-                "PARCEL_ID":      str(attrs.get("OBJECTID", "")),
-                "SITUS_ADDR":     attrs.get("SITEADDR", ""),
-                "ACRES":          attrs.get("ACRES", 0),
-                "LAND_VALUE":     attrs.get("LANDVAL", 0),
-                "ASSESSED_VALUE": attrs.get("LANDVAL", 0),
-                "OWNER_NAME":     attrs.get("OWNNAME", ""),
-                "ZONING":         attrs.get("ZONING", ""),
-                "LU_CODE":        attrs.get("LU", ""),
-                "LU_DESC":        attrs.get("DESCLU", ""),
-                "LATITUDE":       attrs.get("LATITUDE"),
-                "LONGITUDE":      attrs.get("LONGITUDE"),
-                "county":         county_name,
-                "data_source":    "MD iMAP ArcGIS",
-            }
-            # Use X/Y if lat/lon not populated
-            if not normalized["LATITUDE"] and attrs.get("Y"):
-                # MD State Plane coords — approximate conversion for scoring
-                # Proper reprojection would need pyproj; use as-is for proximity
-                normalized["LATITUDE"]  = attrs.get("Y")
-                normalized["LONGITUDE"] = attrs.get("X")
-            parcels.append(normalized)
-
-        log.info(f"  ArcGIS returned {len(parcels)} parcels for {county_name}")
-        return parcels
-
-    except Exception as e:
-        log.warning(f"  ArcGIS pull failed for {county_name}: {e}")
-        return []
-
-
-def pull_parcels_pg_fallback(buy_box: dict, max_records: int = 500) -> list[dict]:
-    """
-    Fallback: Pull PG County parcels directly from PG Planning open data portal.
-    Only used if ArcGIS portal fails for Prince George's.
-    """
-    log.info("  Trying PG County Planning fallback...")
-    params = {
-        "where":          f"ACREAGE >= {buy_box['min_acres']} AND ACREAGE <= {buy_box['max_acres']}",
-        "outFields":      "OBJECTID,ACREAGE,LANDVAL,OWNER,ADDRESS,ZONING,LATITUDE,LONGITUDE",
-        "returnGeometry": "false",
-        "f":              "json",
-        "resultRecordCount": max_records,
-    }
-    try:
-        r = requests.get(PG_PARCEL_URL, params=params, timeout=30,
-                         headers={"User-Agent": "GY6-DealPipeline/1.0"})
-        data = r.json()
-        features = data.get("features", [])
-        parcels = []
-        for f in features:
-            a = f.get("attributes", {})
-            parcels.append({
-                "PARCEL_ID":      str(a.get("OBJECTID", "")),
-                "SITUS_ADDR":     a.get("ADDRESS", ""),
-                "ACRES":          a.get("ACREAGE", 0),
-                "LAND_VALUE":     a.get("LANDVAL", 0),
-                "ASSESSED_VALUE": a.get("LANDVAL", 0),
-                "OWNER_NAME":     a.get("OWNER", ""),
-                "ZONING":         a.get("ZONING", ""),
-                "LATITUDE":       a.get("LATITUDE"),
-                "LONGITUDE":      a.get("LONGITUDE"),
-                "county":         "Prince George's",
-                "data_source":    "PG County Planning",
-            })
-        log.info(f"  PG fallback returned {len(parcels)} parcels")
-        return parcels
-    except Exception as e:
-        log.warning(f"  PG fallback failed: {e}")
-        return []
-
-
-def pull_parcels_soda(county_key: str, buy_box: dict, max_records: int = 1000) -> list[dict]:
-    """
-    Secondary fallback: Maryland open data via Socrata SODA API.
-    Dataset: Maryland Property Sales (has parcel-level data with address/owner).
-    Endpoint: opendata.maryland.gov/resource/vqjs-wt3p.json (Real Property Sales)
-    """
-    county_name = COUNTY_NAMES[county_key]
-    # SODA county name mapping
-    soda_county = {
-        "anne_arundel":   "ANNE ARUNDEL",
-        "prince_georges": "PRINCE GEORGES",
-        "howard":         "HOWARD",
-        "charles":        "CHARLES",
-    }.get(county_key, county_name.upper())
-
-    log.info(f"  Trying SODA API for {county_name}...")
-
-    url = "https://opendata.maryland.gov/resource/vqjs-wt3p.json"
-    params = {
-        "$where":  f"county_name='{soda_county}' AND land_area_sf >= {buy_box['min_acres'] * 43560} AND land_area_sf <= {buy_box['max_acres'] * 43560}",
-        "$limit":  max_records,
-        "$select": "acct_id,owner_name,property_address,county_name,land_area_sf,land_value,zoning,latitude,longitude",
-    }
-    try:
-        r = requests.get(url, params=params, timeout=30,
-                         headers={"User-Agent": "GY6-DealPipeline/1.0"})
-        data = r.json()
-        if not isinstance(data, list):
-            log.warning(f"  SODA unexpected response: {str(data)[:100]}")
+        content = r.text
+        if not content or len(content) < 100:
+            log.warning(f"  Redfin empty response for {county['name']}")
             return []
+
+        # Find CSV start — Redfin prepends a disclaimer line
+        lines = content.split("\n")
+        csv_start = 0
+        for i, line in enumerate(lines):
+            if "ADDRESS" in line.upper() or "PRICE" in line.upper():
+                csv_start = i
+                break
+
+        csv_content = "\n".join(lines[csv_start:])
+        reader = csv.DictReader(io.StringIO(csv_content))
         parcels = []
-        for row in data:
-            sf = float(row.get("land_area_sf") or 0)
+
+        for row in reader:
+            price_str = row.get("PRICE", "0").replace("$", "").replace(",", "").strip()
+            sqft_str  = row.get("SQUARE FEET", "0").replace(",", "").strip()
+            lot_str   = row.get("LOT SIZE", "0").replace(",", "").strip()
+
+            try:
+                price = float(price_str) if price_str and price_str not in ("—", "") else 0
+            except ValueError:
+                price = 0
+
+            # Acreage: try lot size first, then square feet
+            acres = 0
+            for val in [lot_str, sqft_str]:
+                if val and val not in ("—", ""):
+                    try:
+                        n = float(val)
+                        acres = n / 43560 if n > 100 else n  # >100 = sqft, else acres
+                        if 0.1 < acres < 100:
+                            break
+                    except ValueError:
+                        continue
+
+            try:
+                lat = float(row.get("LATITUDE", "") or 0) or None
+                lon = float(row.get("LONGITUDE", "") or 0) or None
+            except ValueError:
+                lat = lon = None
+
+            if price == 0 or acres < buy_box["min_acres"]:
+                continue
+
             parcels.append({
-                "PARCEL_ID":      row.get("acct_id", ""),
-                "SITUS_ADDR":     row.get("property_address", ""),
-                "ACRES":          round(sf / 43560, 3) if sf else 0,
-                "LAND_VALUE":     float(row.get("land_value") or 0),
-                "ASSESSED_VALUE": float(row.get("land_value") or 0),
-                "OWNER_NAME":     row.get("owner_name", ""),
-                "ZONING":         row.get("zoning", ""),
-                "LATITUDE":       float(row.get("latitude") or 0) or None,
-                "LONGITUDE":      float(row.get("longitude") or 0) or None,
-                "county":         county_name,
-                "data_source":    "MD SODA API",
+                "PARCEL_ID":      row.get("MLS#", row.get("LISTING ID", f"RF-{len(parcels)}")),
+                "SITUS_ADDR":     row.get("ADDRESS", ""),
+                "ACRES":          round(acres, 3),
+                "LAND_VALUE":     price,
+                "ASSESSED_VALUE": price,
+                "OWNER_NAME":     "",
+                "ZONING":         "",
+                "LATITUDE":       lat,
+                "LONGITUDE":      lon,
+                "county":         county["name"],
+                "data_source":    "Redfin",
+                "listing_url":    row.get("URL (SEE https://www.redfin.com/buy-a-home/comparative-market-analysis FOR INFO ON PRICING)", ""),
+                "days_on_market": row.get("DAYS ON MARKET", ""),
             })
-        log.info(f"  SODA returned {len(parcels)} parcels for {county_name}")
+
+        log.info(f"  Redfin: {len(parcels)} land listings for {county['name']}")
         return parcels
+
     except Exception as e:
-        log.warning(f"  SODA pull failed for {county_name}: {e}")
+        log.warning(f"  Redfin failed for {county['name']}: {e}")
         return []
 
 
-def pull_parcels(county_key: str, buy_box: dict, max_records: int = 1000) -> list[dict]:
-    """
-    Master pull function with fallback chain:
-    1. ArcGIS public portal (primary)
-    2. SODA API (secondary)
-    3. PG County Planning direct (PG only)
-    Returns normalized parcel list ready for Layer B filter.
-    """
-    # Try primary
-    parcels = pull_parcels_arcgis(county_key, buy_box, max_records)
+def pull_realtor_land(county_key: str, buy_box: dict) -> list[dict]:
+    county_name = REDFIN_COUNTIES[county_key]["name"]
+    log.info(f"  Trying Realtor.com: {county_name}...")
+
+    slug = {
+        "anne_arundel":   "anne-arundel-county_md",
+        "prince_georges": "prince-georges-county_md",
+        "howard":         "howard-county_md",
+        "charles":        "charles-county_md",
+    }.get(county_key, "")
+
+    url = "https://www.realtor.com/api/v1/hulk_main_srp/list"
+    params = {
+        "client_id":  "rdc-x",
+        "schema":     "vesta",
+        "prop_type":  "land",
+        "list_price": f"0-{int(buy_box['max_price'] * 1.5)}",
+        "state_code": "MD",
+        "county":     f"{county_name} County",
+        "offset":     0,
+        "limit":      200,
+    }
+
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=30)
+        data = r.json()
+        listings = data.get("data", {}).get("results", [])
+        parcels = []
+        for item in listings:
+            loc   = item.get("location", {}).get("address", {})
+            desc  = item.get("description", {})
+            coord = item.get("location", {}).get("coordinate", {})
+            price = item.get("list_price", 0) or 0
+            sqft  = desc.get("lot_sqft", 0) or 0
+            acres = round(sqft / 43560, 3) if sqft else 0
+
+            if acres < buy_box["min_acres"]:
+                continue
+
+            parcels.append({
+                "PARCEL_ID":      item.get("property_id", ""),
+                "SITUS_ADDR":     f"{loc.get('line','')} {loc.get('city','')} MD".strip(),
+                "ACRES":          acres,
+                "LAND_VALUE":     price,
+                "ASSESSED_VALUE": price,
+                "OWNER_NAME":     "",
+                "ZONING":         "",
+                "LATITUDE":       coord.get("lat"),
+                "LONGITUDE":      coord.get("lon"),
+                "county":         county_name,
+                "data_source":    "Realtor.com",
+                "listing_url":    f"https://www.realtor.com{item.get('permalink','')}",
+                "days_on_market": item.get("list_date", ""),
+            })
+
+        log.info(f"  Realtor.com: {len(parcels)} listings for {county_name}")
+        return parcels
+    except Exception as e:
+        log.warning(f"  Realtor.com failed for {county_name}: {e}")
+        return []
+
+
+def pull_parcels(county_key: str, buy_box: dict, max_records: int = 350) -> list[dict]:
+    """Primary: Redfin CSV. Fallback: Realtor.com."""
+    parcels = pull_redfin_land(county_key, buy_box)
     if parcels:
         return parcels
-
-    # Try SODA fallback
-    time.sleep(1)
-    parcels = pull_parcels_soda(county_key, buy_box, max_records)
-    if parcels:
-        return parcels
-
-    # PG-specific fallback
-    if county_key == "prince_georges":
-        time.sleep(1)
-        parcels = pull_parcels_pg_fallback(buy_box, max_records)
-
-    return parcels
+    time.sleep(2)
+    return pull_realtor_land(county_key, buy_box)
