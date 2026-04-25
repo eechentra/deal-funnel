@@ -382,11 +382,20 @@ def run():
     log.info(f"Deal pipeline starting — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     log.info("=" * 60)
 
+    # Layer A v2 — ArcGIS public portal + SODA fallback
+    try:
+        from layer_a import pull_parcels as pull_v2
+        use_v2 = True
+        log.info("Layer A v2 active (ArcGIS + SODA fallback)")
+    except ImportError:
+        use_v2 = False
+
     all_deals = []
+
 
     for county_key in COUNTIES:
         log.info(f"\n--- {COUNTIES[county_key]['name']} County ---")
-        parcels = pull_parcels(county_key)
+        parcels = pull_v2(county_key, BUY_BOX) if use_v2 else pull_parcels(county_key)
         if not parcels:
             log.warning(f"  No parcels returned — check GIS endpoint")
             continue
