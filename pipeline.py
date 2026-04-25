@@ -1,4 +1,3 @@
-
 """
 GY6 / Land Deal Sourcing Pipeline
 Markets: Anne Arundel, Prince George's, Howard, Charles — Maryland
